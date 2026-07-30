@@ -5,8 +5,8 @@
 #   FUXA      draws it and writes setpoints back
 #
 # Every component is MIT/EPL/BSD. No licence server, no seat count, nothing
-# that expires. Runs on CT100 alongside the other labs; reachable over
-# Tailscale only, same pattern as the vault.
+# that expires. Every port binds to 127.0.0.1 — reach it over a VPN or a
+# tunnel rather than publishing it.
 
 name: fuxa-lab
 
