@@ -1,0 +1,122 @@
+[
+  {
+    "id": "t101tab",
+    "type": "tab",
+    "label": "T-101 Rotterdam",
+    "disabled": false,
+    "info": "Pump/tank process model for the FUXA lab.\n\nPublishes to northwind/rotterdam/T101/#\nAccepts writes on northwind/rotterdam/T101/cmd/#"
+  },
+  {
+    "id": "mqttbroker1",
+    "type": "mqtt-broker",
+    "name": "fuxa-mosquitto",
+    "broker": "mosquitto",
+    "port": "1883",
+    "clientid": "nodered-t101",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true
+  },
+  {
+    "id": "tick",
+    "type": "inject",
+    "z": "t101tab",
+    "name": "500 ms",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "0.5",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "2",
+    "topic": "",
+    "payload": "",
+    "payloadType": "date",
+    "x": 120,
+    "y": 120,
+    "wires": [
+      [
+        "sim"
+      ]
+    ]
+  },
+  {
+    "id": "sim",
+    "type": "function",
+    "z": "t101tab",
+    "name": "T-101 process model",
+    "func": "\n// ---------------------------------------------------------------------------\n// T-101 process model \u2014 Northwind, Rotterdam terminal.\n//\n// One tank, one modulating inlet valve, two pumps in duty/standby with\n// rotation on every start. Level is integrated properly from a mass balance\n// rather than faked with a sine wave, because the whole point of the lab is\n// that the screen is driven by something that behaves like a plant.\n//\n//   dV/dt = Qin - Qout          V volume m3, Q m3/h\n//   level = V / (area * height) * 100\n//\n// Runs on a 500 ms tick. dt is taken from the clock, not assumed, so a slow\n// tick does not silently change the process gain.\n// ---------------------------------------------------------------------------\n\nvar s = context.get('s');\nif (!s) {\n    s = {\n        // geometry\n        area: 7.07, height: 5.0,          // m2, m  -> 35.35 m3\n        volume: 12.0,                     // m3 start ~34%\n        // valve\n        valveCmd: 65, valvePos: 65,       // %\n        valveMaxFlow: 40,                 // m3/h at 100%\n        // pumps\n        duty: 'A',\n        pumps: { A: {run:false, spd:0, hrs:1284.5, fault:false, rated:60},\n                 B: {run:false, spd:0, hrs:1197.2, fault:false, rated:60} },\n        // setpoints\n        spStart: 78, spStop: 32,          // pump start / stop level %\n        spLL: 10, spL: 20, spH: 80, spHH: 90,\n        mode: 'AUTO',\n        manualPumpA: false, manualPumpB: false,\n        last: Date.now(),\n        totaliser: 0\n    };\n}\n\n\n// --- apply any pending writeback from the HMI, once, at the top of the tick ---\nvar c = flow.get('cmd');\nif (c) {\n    if (c.valveCmd    !== undefined) { s.valveCmd = c.valveCmd; }\n    if (c.spStart     !== undefined) { s.spStart  = c.spStart; }\n    if (c.spStop      !== undefined) { s.spStop   = c.spStop; }\n    if (c.mode        !== undefined) { s.mode     = c.mode; }\n    if (c.manualPumpA !== undefined) { s.manualPumpA = c.manualPumpA; }\n    if (c.manualPumpB !== undefined) { s.manualPumpB = c.manualPumpB; }\n    if (c.faultA      !== undefined) { s.pumps.A.fault = c.faultA; }\n    if (c.faultB      !== undefined) { s.pumps.B.fault = c.faultB; }\n    flow.set('cmd', null);\n}\n\nvar now = Date.now();\nvar dt = (now - s.last) / 1000;            // seconds\nif (dt <= 0 || dt > 5) { dt = 0.5; }       // guard against clock jumps\ns.last = now;\n// TIME COMPRESSION. The physics below are real; the clock is not. At true\n// rates a full duty cycle on this tank takes ~35 minutes, which makes for a\n// dead screen. SPEED=20 compresses it to roughly three minutes without\n// touching the equations \u2014 every flow, level and totaliser figure remains\n// dimensionally correct, it just happens twenty times faster.\nvar SPEED = 20;\nvar dth = (dt / 3600) * SPEED;             // hours (compressed)\n\n// --- inlet valve: first-order travel, 12 %/s full stroke ---\nvar err = s.valveCmd - s.valvePos;\nvar step = Math.min(Math.abs(err), 12 * dt);\ns.valvePos += Math.sign(err) * step;\ns.valvePos = Math.max(0, Math.min(100, s.valvePos));\n\nvar level = (s.volume / (s.area * s.height)) * 100;\n\n// --- pump control ---\nvar A = s.pumps.A, B = s.pumps.B;\nif (s.mode === 'AUTO') {\n    var anyRunning = A.run || B.run;\n    if (!anyRunning && level >= s.spStart) {\n        // rotate duty on every start so runtime hours stay even\n        s.duty = (s.duty === 'A') ? 'B' : 'A';\n        var d = s.pumps[s.duty];\n        if (!d.fault) { d.run = true; }\n        else { s.pumps[s.duty === 'A' ? 'B' : 'A'].run = true; }   // standby picks up\n    }\n    if (anyRunning && level <= s.spStop) { A.run = false; B.run = false; }\n    // a faulted pump drops out and the standby takes over immediately\n    ['A','B'].forEach(function(k){\n        if (s.pumps[k].fault && s.pumps[k].run) {\n            s.pumps[k].run = false;\n            var o = (k === 'A') ? 'B' : 'A';\n            if (!s.pumps[o].fault && level > s.spStop) { s.pumps[o].run = true; }\n        }\n    });\n} else {\n    A.run = s.manualPumpA && !A.fault;\n    B.run = s.manualPumpB && !B.fault;\n}\n\n// --- pump speed ramp + runtime hours ---\n['A','B'].forEach(function(k){\n    var p = s.pumps[k];\n    var target = p.run ? 100 : 0;\n    var d2 = target - p.spd;\n    p.spd += Math.sign(d2) * Math.min(Math.abs(d2), 45 * dt);   // ~2.2 s to full\n    p.spd = Math.max(0, Math.min(100, p.spd));\n    if (p.spd > 1) { p.hrs += dth; }\n});\n\n// --- mass balance ---\nvar qin  = s.valveMaxFlow * (s.valvePos / 100);\nvar qout = (A.rated * A.spd / 100) + (B.rated * B.spd / 100);\ns.volume += (qin - qout) * dth;\n\n// hard physical limits \u2014 a tank cannot go negative or overflow past 100%\nvar vmax = s.area * s.height;\nif (s.volume < 0) { s.volume = 0; qout = qin; }\nif (s.volume > vmax) { s.volume = vmax; }\ns.totaliser += qout * dth;\n\nlevel = (s.volume / vmax) * 100;\n\n// --- alarms ---\nvar aLL = level <= s.spLL, aL = level <= s.spL;\nvar aH  = level >= s.spH,  aHH = level >= s.spHH;\nvar anyAlarm = aLL || aHH || A.fault || B.fault;\n\ncontext.set('s', s);\n\nfunction r(v, n) { return Math.round(v * Math.pow(10, n)) / Math.pow(10, n); }\nvar B_ = 'northwind/rotterdam/T101/';\nvar out = [\n    { topic: B_+'level',            payload: r(level,2) },\n    { topic: B_+'volume',           payload: r(s.volume,2) },\n    { topic: B_+'inflow',           payload: r(qin,2) },\n    { topic: B_+'outflow',          payload: r(qout,2) },\n    { topic: B_+'totaliser',        payload: r(s.totaliser,1) },\n    { topic: B_+'valve/position',   payload: r(s.valvePos,1) },\n    { topic: B_+'valve/command',    payload: r(s.valveCmd,1) },\n    { topic: B_+'pumpA/running',    payload: A.run ? 1 : 0 },\n    { topic: B_+'pumpA/speed',      payload: r(A.spd,1) },\n    { topic: B_+'pumpA/hours',      payload: r(A.hrs,1) },\n    { topic: B_+'pumpA/fault',      payload: A.fault ? 1 : 0 },\n    { topic: B_+'pumpB/running',    payload: B.run ? 1 : 0 },\n    { topic: B_+'pumpB/speed',      payload: r(B.spd,1) },\n    { topic: B_+'pumpB/hours',      payload: r(B.hrs,1) },\n    { topic: B_+'pumpB/fault',      payload: B.fault ? 1 : 0 },\n    { topic: B_+'duty',             payload: s.duty },\n    { topic: B_+'mode',             payload: s.mode },\n    { topic: B_+'setpoint/start',   payload: s.spStart },\n    { topic: B_+'setpoint/stop',    payload: s.spStop },\n    { topic: B_+'setpoint/LL',      payload: s.spLL },\n    { topic: B_+'setpoint/HH',      payload: s.spHH },\n    { topic: B_+'alarm/LL',         payload: aLL ? 1 : 0 },\n    { topic: B_+'alarm/L',          payload: aL ? 1 : 0 },\n    { topic: B_+'alarm/H',          payload: aH ? 1 : 0 },\n    { topic: B_+'alarm/HH',         payload: aHH ? 1 : 0 },\n    { topic: B_+'alarm/active',     payload: anyAlarm ? 1 : 0 }\n];\nreturn [out];\n",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 330,
+    "y": 120,
+    "wires": [
+      [
+        "mqttout"
+      ]
+    ]
+  },
+  {
+    "id": "mqttout",
+    "type": "mqtt out",
+    "z": "t101tab",
+    "name": "publish",
+    "topic": "",
+    "qos": "0",
+    "retain": "true",
+    "respTopic": "",
+    "contentType": "",
+    "userProps": "",
+    "correl": "",
+    "expiry": "",
+    "broker": "mqttbroker1",
+    "x": 580,
+    "y": 120,
+    "wires": []
+  },
+  {
+    "id": "cmdin",
+    "type": "mqtt in",
+    "z": "t101tab",
+    "name": "cmd/#",
+    "topic": "northwind/rotterdam/T101/cmd/#",
+    "qos": "0",
+    "datatype": "auto-detect",
+    "broker": "mqttbroker1",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 120,
+    "y": 220,
+    "wires": [
+      [
+        "cmd"
+      ]
+    ]
+  },
+  {
+    "id": "cmd",
+    "type": "function",
+    "z": "t101tab",
+    "name": "apply command",
+    "func": "\n// Writeback from FUXA. Topic tail decides the target; everything is clamped\n// here rather than trusting the HMI, because an operator screen is an input\n// device and inputs get validated at the process end.\nvar tail = msg.topic.split('/cmd/')[1];\nvar v = parseFloat(msg.payload);\nvar t = String(msg.payload).trim().toUpperCase();\n\nvar p = {};\nif (tail === 'valve')          { p.valveCmd = Math.max(0, Math.min(100, v)); }\nelse if (tail === 'setpoint/start') { p.spStart = Math.max(0, Math.min(100, v)); }\nelse if (tail === 'setpoint/stop')  { p.spStop  = Math.max(0, Math.min(100, v)); }\nelse if (tail === 'mode')      { p.mode = (t === 'MANUAL') ? 'MANUAL' : 'AUTO'; }\nelse if (tail === 'pumpA')     { p.manualPumpA = (v === 1 || t === 'TRUE'); }\nelse if (tail === 'pumpB')     { p.manualPumpB = (v === 1 || t === 'TRUE'); }\nelse if (tail === 'pumpA/fault') { p.faultA = (v === 1 || t === 'TRUE'); }\nelse if (tail === 'pumpB/fault') { p.faultB = (v === 1 || t === 'TRUE'); }\nelse { return null; }\n\nflow.set('cmd', p);\nnode.status({fill:'blue', shape:'dot', text: tail + ' = ' + msg.payload});\nreturn null;\n",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 330,
+    "y": 220,
+    "wires": [
+      []
+    ]
+  }
+]

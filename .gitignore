@@ -1,0 +1,8 @@
+nodered/.config.*
+nodered/.sessions.json
+nodered/node_modules/
+nodered/lib/
+nodered/.npm/
+docs/fuxa-src/
+__pycache__/
+*.pyc
