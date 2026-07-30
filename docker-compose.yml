@@ -63,7 +63,10 @@ services:
     ports:
       - "127.0.0.1:1881:1881"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:1881/ >/dev/null 2>&1 || exit 1"]
+      # node, not wget or curl: the FUXA image is a slim Node runtime and has
+      # neither, so a wget-based check fails with exit 1 and no output while the
+      # service is perfectly healthy.
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:1881/',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))\""]
       interval: 30s
       timeout: 10s
       retries: 3
